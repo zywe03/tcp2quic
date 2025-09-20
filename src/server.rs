@@ -1,49 +1,69 @@
 use crate::common;
-use futures::{future::FutureExt, select, StreamExt};
-use quinn::{
-    CertificateChain, Connecting, Endpoint, NewConnection, ServerConfigBuilder,
-};
+use quinn::{Endpoint, ServerConfig};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpStream;
 
-pub async fn run(local: SocketAddr, remote: SocketAddr, hostname: String) {
-    let (cert, key) = common::generate_certificate(vec![hostname]).unwrap();
-    let mut config_builder = ServerConfigBuilder::default();
-    config_builder
-        .certificate(CertificateChain::from_certs(vec![cert]), key)
-        .unwrap();
-    let config = config_builder.build();
-    let mut ep_builder = Endpoint::builder();
-    ep_builder.listen(config);
-    let (_, mut incoming) = ep_builder.bind(&local).expect("failed to bind");
-    while let Some(conn) = incoming.next().await {
-        tokio::spawn(handle(conn, remote));
+pub async fn run(local: SocketAddr, remote: SocketAddr, hostname: String) -> std::io::Result<()> {
+    let (certs, key) = common::generate_certificate(vec![hostname])?;
+
+    let crypto_provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+
+    let rustls_config = rustls::ServerConfig::builder_with_provider(crypto_provider)
+        .with_safe_default_protocol_versions()
+        .map_err(common::to_invalid_input_error)?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(common::to_invalid_input_error)?;
+
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(rustls_config)
+            .map_err(std::io::Error::other)?
+    ));
+
+    let transport_config = common::create_transport_config()?;
+    server_config.transport = Arc::new(transport_config);
+
+    let endpoint = Endpoint::server(server_config, local)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::AddrInUse, e))?;
+
+    while let Some(incoming) = endpoint.accept().await {
+        tokio::spawn(handle(incoming, remote));
     }
+
+    Ok(())
 }
 
 async fn handle(
-    connecting: Connecting,
+    incoming: quinn::Incoming,
     remote: SocketAddr,
 ) -> std::io::Result<()> {
-    let connection = match connecting.into_0rtt() {
-        Ok((conn, _)) => conn,
-        Err(conn) => conn.await?,
-    };
-    let NewConnection {
-        connection: _,
-        mut bi_streams,
-        ..
-    } = connection;
+    let connection = incoming.await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e))?;
 
-    let mut tcp_stream = TcpStream::connect(&remote).await?;
-    tcp_stream.set_nodelay(true)?;
-    let (mut r_tcp, mut w_tcp) = tcp_stream.split();
-    while let Some(udp_stream) = bi_streams.next().await {
-        let (mut w_udp, mut r_udp) = udp_stream?;
-        select! {
-            _ = common::copy(&mut r_udp, &mut w_tcp).fuse() => {},
-            _ = common::copy(&mut r_tcp, &mut w_udp).fuse() => {},
-        };
+    loop {
+        match connection.accept_bi().await {
+            Ok((mut w_quic, mut r_quic)) => {
+                let mut tcp_stream = TcpStream::connect(&remote).await?;
+                tcp_stream.set_nodelay(true)?;
+                let (mut r_tcp, mut w_tcp) = tcp_stream.split();
+
+                tokio::select! {
+                    _ = common::copy_quic_to_tcp(&mut r_quic, &mut w_tcp) => {},
+                    _ = common::copy_tcp_to_quic(&mut r_tcp, &mut w_quic) => {},
+                };
+            }
+            Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
+                break;
+            }
+            Err(quinn::ConnectionError::ConnectionClosed { .. }) => {
+                break;
+            }
+            Err(_) => {
+                break;
+            }
+        }
     }
+
     Ok(())
 }
