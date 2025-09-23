@@ -54,7 +54,7 @@ pub fn create_transport_config() -> Result<quinn::TransportConfig> {
     Ok(transport)
 }
 
-// 免频繁flush导致的性能损失，只在读取阻塞时才flush
+// Only flush when a read operation is blocked
 pub async fn copy_quic_to_tcp(
     recv_stream: &mut quinn::RecvStream,
     tcp_writer: &mut (impl AsyncWrite + Unpin),
@@ -75,7 +75,6 @@ pub async fn copy_quic_to_tcp(
             Ok(Ok(_)) => break,
             Ok(Err(e)) => return Err(std::io::Error::other(e)),
             Err(_) => {
-                // 读取阻塞时才flush，避免每次写入都flush
                 if need_flush {
                     tcp_writer.flush().await?;
                     need_flush = false;

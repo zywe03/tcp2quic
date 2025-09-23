@@ -61,7 +61,7 @@ impl Config {
     }
 }
 
-// 配置解析
+// Configuration parsing
 macro_rules! has_opt {
     ($it: expr, $name: expr) => {
         $it.find(|&kv| kv == $name).is_some()

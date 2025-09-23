@@ -114,10 +114,11 @@ async fn handle(
     let connecting = ep
         .connect(remote, &sni)
         .map_err(|e| Error::new(ErrorKind::ConnectionAborted, e))?;
-
-    // 尝试0-RTT以减少握手延迟
     let connection = match connecting.into_0rtt() {
-        Ok((conn, _zero_rtt_accepted)) => conn,
+        Ok((conn, zero)) => {
+            zero.await;
+            conn
+        }
         Err(conn) => conn.await?,
     };
 

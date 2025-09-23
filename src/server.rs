@@ -38,8 +38,14 @@ async fn handle(
     incoming: quinn::Incoming,
     remote: SocketAddr,
 ) -> std::io::Result<()> {
-    let connection = incoming.await
+    let connecting = incoming.accept()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e))?;
+
+    let connection = match connecting.into_0rtt() {
+        Ok((conn, _)) => conn,
+        Err(conn) => conn.await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionAborted, e))?,
+    };
 
     loop {
         match connection.accept_bi().await {
